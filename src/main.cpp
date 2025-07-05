@@ -1,151 +1,255 @@
 #include <SBUS.h>
+
+// Pin definitions
 #define RX_PIN 3
 #define TX_PIN -1
+#define MOTOR1_EN 35
 #define MOTOR1_IN1 32
 #define MOTOR1_IN2 33
-#define MOTOR1_EN 35
-#define MOTOR2_IN1 14
-#define MOTOR2_IN2 12
 #define MOTOR2_EN 27
-// Separate PWM channels for independent speed control
+#define MOTOR2_IN1 14
+#define MOTOR2_IN2 21
+
+// Motor configuration
 #define MOTOR1_CHANNEL 0
 #define MOTOR2_CHANNEL 1
-#define MOTOR_FREQ 5000
+#define MOTOR_FREQ 490
 #define MOTOR_RES 8
 #define MAX_SPEED 255
+
+// Control parameters
 #define MAX_CHANNEL_VALUE 1800
 #define MIN_CHANNEL_VALUE 200
 #define DIRECTION_CONTROL_DEADZONE 50
-#define MOVE_CONTROL_DEADZONE 100
-
+#define MOVE_CONTROL_DEADZONE 50
 #define SIGNAL_TIMEOUT 500 // ms before considering signal lost
+#define LEFT_MIN_START 40  // Tune experimentally for your hardware
+#define RIGHT_MIN_START 36 // Tune experimentally for your hardware
 
+// Weapon Config
+#define WEAPON_PIN 26
+// Motor direction enum for better readability
+enum Direction
+{
+  FORWARD,
+  BACKWARD,
+  STOP
+};
+
+// Motor class to encapsulate motor functionality
+class Motor
+{
+private:
+  uint8_t in1Pin;
+  uint8_t in2Pin;
+  uint8_t enPin;
+  uint8_t pwmChannel;
+  String name;
+
+public:
+  Motor(uint8_t in1, uint8_t in2, uint8_t en, uint8_t channel, String name)
+      : in1Pin(in1), in2Pin(in2), enPin(en), pwmChannel(channel) {}
+
+  void setup()
+  {
+    pinMode(in1Pin, OUTPUT);
+    pinMode(in2Pin, OUTPUT);
+    pinMode(enPin, OUTPUT);
+    pinMode(WEAPON_PIN, OUTPUT);
+    digitalWrite(WEAPON_PIN, LOW);
+    ledcSetup(pwmChannel, MOTOR_FREQ, MOTOR_RES);
+    ledcAttachPin(enPin, pwmChannel);
+    this->name = name;
+    stop();
+  }
+
+  void setDirection(Direction dir)
+  {
+    switch (dir)
+    {
+    case FORWARD:
+      digitalWrite(in1Pin, HIGH);
+      digitalWrite(in2Pin, LOW);
+      break;
+    case BACKWARD:
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, HIGH);
+      break;
+    case STOP:
+    default:
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, LOW);
+      break;
+    }
+  }
+
+  void setSpeed(int speed)
+  {
+    Serial.print(">" + this->name + "Speed:");
+    Serial.println(speed);
+
+    speed = constrain(speed, 0, MAX_SPEED);
+    if (speed > MOVE_CONTROL_DEADZONE && speed < MOVE_CONTROL_DEADZONE + 30)
+    {
+      Serial.println("BOOOST !!");
+      speed = MAX_SPEED;
+    }
+    else
+    {
+      Serial.println("HHOOHHAaaa");
+    }
+
+    ledcWrite(pwmChannel, speed);
+  }
+
+  void stop()
+  {
+    setDirection(STOP);
+    setSpeed(0);
+  }
+
+  void run(Direction dir, int speed)
+  {
+    setDirection(dir);
+
+    setSpeed(speed);
+  }
+};
+
+// Global variables
 unsigned long lastValidSignal = 0; // Timestamp of last valid signal
-
-void TestMotor();
-void PlotSerial();
-void ControlMotors();
-void ControlWheels(int16_t movingValue, int16_t directionValue);
-void MoveBackword(int speed, bool moveLeft, bool moveRight);
-void MoveForward(int speed, bool moveLeft, bool moveRight);
-int NormalizeRawValue(int16_t raw);
-void StopWheels();
-bool isSignalLost();
-void ShowChannelOutput();
-
 bfs::SbusRx sbus(&Serial2, RX_PIN, TX_PIN, true);
+// Fix motor naming
+Motor leftMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_EN, MOTOR1_CHANNEL, "LEFT_MOTOR");
+Motor rightMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_EN, MOTOR2_CHANNEL, "RIGHT_MOTOR");
+
+// Function prototypes
+void processReceiverInput();
+void controlVehicle(int16_t throttleValue, int16_t steeringValue, int16_t weaponValue, int16_t weaponSpeed);
+int normalizeChannelValue(int16_t raw, int16_t minVal = MIN_CHANNEL_VALUE, int16_t maxVal = MAX_CHANNEL_VALUE, int minOutput = -MAX_SPEED, int maxOutput = MAX_SPEED);
+void PlotSerial();
+void processWeaponInput(int weaponValue, int processWeaponInput);
 
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
+  // Initialize SBUS receiver
   sbus.Begin();
-  // Configure motor direction pins as outputs
-  pinMode(MOTOR1_IN1, OUTPUT);
-  pinMode(MOTOR1_IN2, OUTPUT);
-  pinMode(MOTOR2_IN1, OUTPUT);
-  pinMode(MOTOR2_IN2, OUTPUT);
 
-  // Configure PWM for motor speed control - separate channels
-  ledcSetup(MOTOR1_CHANNEL, MOTOR_FREQ, MOTOR_RES);
-  ledcSetup(MOTOR2_CHANNEL, MOTOR_FREQ, MOTOR_RES);
-  ledcAttachPin(MOTOR1_EN, MOTOR1_CHANNEL);
-  ledcAttachPin(MOTOR2_EN, MOTOR2_CHANNEL);
-
-  // Start with motors stopped
-  StopWheels();
+  // Setup motors
+  leftMotor.setup();
+  rightMotor.setup();
 }
 
 void loop()
 {
+  processReceiverInput();
 
-  ControlMotors();
-
-  // Uncomment for debugging
   // PlotSerial();
 }
 
-// Check if signal is lost
-bool isSignalLost()
+void processReceiverInput()
 {
   if (sbus.Read())
   {
     bfs::SbusData data = sbus.data();
 
-    // Update timestamp on valid signal
-    lastValidSignal = millis();
-
-    // Check failsafe flag from receiver
-    if (data.failsafe)
-    {
-      Serial.println("Receiver failsafe active!");
-      return true;
-    }
+    // Channel 0 is throttle, Channel 2 is steering
+    controlVehicle(data.ch[1], data.ch[3], data.ch[5], data.ch[7]);
   }
-
-  // Check for signal timeout
-  if (millis() - lastValidSignal > SIGNAL_TIMEOUT)
-  {
-    return true;
-  }
-
-  return false;
 }
 
-void TestMotor()
+void controlVehicle(int16_t throttleValue, int16_t steeringValue, int16_t weaponValue, int16_t weaponSpeed)
 {
-  // Test motor 1
-  Serial.println("Testing Motor 1 - Forward");
-  digitalWrite(MOTOR1_IN1, HIGH);
-  digitalWrite(MOTOR1_IN2, LOW);
-  ledcWrite(MOTOR1_CHANNEL, MAX_SPEED);
-  delay(2000);
+  // Normalize raw values to motor speed range
+  int throttle = normalizeChannelValue(throttleValue);
+  int steering = normalizeChannelValue(steeringValue);
+  int weaponActivation = normalizeChannelValue(weaponValue);
+  int normalizedWeaponSpeed = normalizeChannelValue(weaponSpeed, 200, 1800, 0, 255);
+  // Determine steering direction
+  bool turnLeft = (steering < -DIRECTION_CONTROL_DEADZONE);
+  bool turnRight = (steering > DIRECTION_CONTROL_DEADZONE);
 
-  // Brake (short pause)
-  Serial.println("Motor 1 - Brake");
-  digitalWrite(MOTOR1_IN1, LOW);
-  digitalWrite(MOTOR1_IN2, LOW);
-  delay(500);
+  // For debugging
+  Serial.print(">Throttle:");
+  Serial.println(throttle);
+  Serial.print(">Steering:");
+  Serial.println(steering);
+  Serial.print(">Left:");
+  Serial.println((int)turnLeft);
+  Serial.print(">Right:");
+  Serial.println((int)turnRight);
+  Serial.print(">Weapon:");
+  Serial.println((int)weaponActivation);
+  Serial.print(">normalizedWeaponSpeed:");
+  Serial.println((int)normalizedWeaponSpeed);
+  processWeaponInput(weaponActivation, weaponSpeed);
+  // Handle forward movement
+  if (throttle > MOVE_CONTROL_DEADZONE)
+  {
+    if (turnLeft && !turnRight)
+    {
+      // Turn left while moving forward
+      leftMotor.stop();
+      rightMotor.run(FORWARD, throttle);
+    }
+    else if (turnRight && !turnLeft)
+    {
+      // Turn right while moving forward
+      leftMotor.run(FORWARD, throttle);
+      rightMotor.stop();
+    }
+    else
+    {
+      // Move straight forward
+      leftMotor.run(FORWARD, throttle);
+      rightMotor.run(FORWARD, throttle);
+    }
+  }
+  // Handle backward movement
+  else if (throttle < -MOVE_CONTROL_DEADZONE)
+  {
+    int speed = abs(throttle);
+    if (turnLeft && !turnRight)
+    {
+      // Turn left while moving backward
+      leftMotor.stop();
+      rightMotor.run(BACKWARD, speed);
+    }
+    else if (turnRight && !turnLeft)
+    {
+      // Turn right while moving backward
+      leftMotor.run(BACKWARD, speed);
+      rightMotor.stop();
+    }
+    else
+    {
+      // Move straight backward
+      leftMotor.run(BACKWARD, speed);
+      rightMotor.run(BACKWARD, speed);
+    }
+  }
+  // Stop if within deadzone
+  else
+  {
+    leftMotor.stop();
+    rightMotor.stop();
+  }
+}
 
-  // Reverse
-  Serial.println("Motor 1 - Reverse");
-  digitalWrite(MOTOR1_IN1, LOW);
-  digitalWrite(MOTOR1_IN2, HIGH);
-  ledcWrite(MOTOR1_CHANNEL, MAX_SPEED);
-  delay(2000);
+void processWeaponInput(int weaponValue, int weaponSpeed)
+{
+  int isActivated = weaponValue <= 0 ? HIGH : LOW;
+  digitalWrite(WEAPON_PIN, isActivated);
+}
 
-  // Brake (short pause)
-  Serial.println("Motor 1 - Brake");
-  digitalWrite(MOTOR1_IN1, LOW);
-  digitalWrite(MOTOR1_IN2, LOW);
-  delay(500);
-
-  // Test motor 2
-  Serial.println("Testing Motor 2 - Forward");
-  digitalWrite(MOTOR2_IN1, HIGH);
-  digitalWrite(MOTOR2_IN2, LOW);
-  ledcWrite(MOTOR2_CHANNEL, MAX_SPEED);
-  delay(2000);
-
-  // Brake (short pause)
-  Serial.println("Motor 2 - Brake");
-  digitalWrite(MOTOR2_IN1, LOW);
-  digitalWrite(MOTOR2_IN2, LOW);
-  delay(500);
-
-  // Reverse
-  Serial.println("Motor 2 - Reverse");
-  digitalWrite(MOTOR2_IN1, LOW);
-  digitalWrite(MOTOR2_IN2, HIGH);
-  ledcWrite(MOTOR2_CHANNEL, MAX_SPEED);
-  delay(2000);
-
-  // Brake (short pause)
-  Serial.println("Motor 2 - Brake");
-  digitalWrite(MOTOR2_IN1, LOW);
-  digitalWrite(MOTOR2_IN2, LOW);
-  delay(500);
+int normalizeChannelValue(int16_t raw, int16_t minVal, int16_t maxVal, int minOutput, int maxOutput)
+{
+  // Constrain raw values first to prevent extreme outputs
+  raw = constrain(raw, minVal, maxVal);
+  return map(raw, minVal, maxVal, minOutput, maxOutput);
 }
 
 void PlotSerial()
@@ -154,186 +258,28 @@ void PlotSerial()
   {
     // Get the decoded SBUS data
     bfs::SbusData data = sbus.data();
-
     // Print values in a format suitable for Serial Plotter
     // All values on one line for best plotter visualization
-    Serial.print("CH1:");
-    Serial.print(data.ch[0]);
-    Serial.print(" CH2:");
-    Serial.print(data.ch[1]);
-    Serial.print(" CH3:");
-    Serial.print(data.ch[2]);
-    Serial.print(" CH4:");
-    Serial.print(data.ch[3]);
-    Serial.print(" CH5:");
-    Serial.print(data.ch[4]);
-    Serial.print(" CH6:");
-    Serial.print(data.ch[5]);
-    Serial.print(" CH7:");
-    Serial.print(data.ch[6]);
-    Serial.print(" CH8:");
+    Serial.print(">CH1:");
+    Serial.println(data.ch[0]);
+    Serial.print(">CH2:");
+    Serial.println(data.ch[1]);
+    Serial.print(">CH3:");
+    Serial.println(data.ch[2]);
+    Serial.print(">CH4:");
+    Serial.println(data.ch[3]);
+    Serial.print(">CH5:");
+    Serial.println(data.ch[4]);
+    Serial.print(">CH6:");
+    Serial.println(data.ch[5]);
+    Serial.print(">CH7:");
+    Serial.println(data.ch[6]);
+    Serial.print(">CH8:");
     Serial.println(data.ch[7]);
+    Serial.print(">CH9:");
+    Serial.println(data.ch[8]);
+    Serial.print(">CH10:");
+    Serial.println(data.ch[9]);
   }
   delay(50);
-}
-
-void ShowChannelOutput()
-{
-  if (sbus.Read())
-  {
-    bfs::SbusData data = sbus.data();
-
-    // Clear console and move cursor to home position
-    Serial.write("\033[2J\033[H"); // Clear screen and position cursor at top-left
-
-    Serial.println("SBUS Channel Data:");
-    Serial.println("-----------------");
-
-    for (int i = 0; i < 8; i++)
-    {
-      int16_t rawValue = data.ch[i];
-
-      Serial.print("Channel ");
-      Serial.print(i + 1);
-      Serial.print(": ");
-      Serial.print(rawValue);
-
-      float normalized = (rawValue - 1500) / 500.0;
-      Serial.print(", Normalized: ");
-      Serial.println(normalized, 2);
-    }
-    Serial.print("Failsafe: ");
-    Serial.print(data.failsafe ? "Active" : "Inactive");
-    Serial.print(", Lost Frame: ");
-    Serial.println(data.lost_frame ? "Yes" : "No");
-
-    Serial.println("-----------------");
-  }
-  delay(100);
-}
-
-void ControlMotors()
-{
-  if (sbus.Read())
-  {
-    bfs::SbusData data = sbus.data();
-    lastValidSignal = millis(); // Update timestamp for signal monitoring
-    ControlWheels(data.ch[2], data.ch[0]);
-  }
-}
-
-void ControlWheels(int16_t movingValue, int16_t directionValue)
-{
-  int normalized_move_value = NormalizeRawValue(movingValue);
-  int normalized_direction_value = NormalizeRawValue(directionValue);
-  bool moveRight = (normalized_direction_value > DIRECTION_CONTROL_DEADZONE);
-  bool moveLeft = (normalized_direction_value < -DIRECTION_CONTROL_DEADZONE);
-
-  // For debugging
-  Serial.print(">Moving:");
-  Serial.println(normalized_move_value);
-  Serial.print(">Direction:");
-  Serial.println(normalized_direction_value);
-  Serial.print(">Left:");
-  Serial.println((int)moveLeft);
-  Serial.print(">Right:");
-  Serial.println((int)moveRight);
-
-  if (normalized_move_value > MOVE_CONTROL_DEADZONE)
-    MoveForward(normalized_move_value, moveLeft, moveRight);
-  else if (normalized_move_value < -MOVE_CONTROL_DEADZONE)
-    MoveBackword(normalized_move_value, moveLeft, moveRight);
-  else
-  {
-    StopWheels();
-  }
-}
-
-int NormalizeRawValue(int16_t raw)
-{
-  // Constrain raw values first to prevent extreme outputs
-  raw = constrain(raw, MIN_CHANNEL_VALUE, MAX_CHANNEL_VALUE);
-  return map(raw, MIN_CHANNEL_VALUE, MAX_CHANNEL_VALUE, -MAX_SPEED, MAX_SPEED);
-}
-
-void MoveForward(int speed, bool moveLeft, bool moveRight)
-{
-  speed = constrain(speed, 0, MAX_SPEED);
-
-  // Adjust speeds for turning - differential drive
-  if (moveLeft)
-  {
-    digitalWrite(MOTOR1_IN1, HIGH);
-    digitalWrite(MOTOR1_IN2, LOW);
-    digitalWrite(MOTOR2_IN1, LOW);
-    digitalWrite(MOTOR2_IN2, LOW);
-    ledcWrite(MOTOR1_CHANNEL, 255);
-    ledcWrite(MOTOR2_CHANNEL, 0);
-  }
-  else if (moveRight)
-  {
-    // Set directions for forward movement
-
-    digitalWrite(MOTOR2_IN1, HIGH);
-    digitalWrite(MOTOR2_IN2, LOW);
-    digitalWrite(MOTOR1_IN1, LOW);
-    digitalWrite(MOTOR1_IN2, LOW);
-    ledcWrite(MOTOR2_CHANNEL, 255);
-    ledcWrite(MOTOR1_CHANNEL, 0);
-  }
-  else
-  {
-    digitalWrite(MOTOR1_IN1, HIGH);
-    digitalWrite(MOTOR1_IN2, LOW);
-    digitalWrite(MOTOR2_IN1, HIGH);
-    digitalWrite(MOTOR2_IN2, LOW);
-    ledcWrite(MOTOR1_CHANNEL, 255);
-    ledcWrite(MOTOR2_CHANNEL, 255);
-  }
-
-  // Apply speeds to each motor independently
-}
-
-void MoveBackword(int speed, bool moveLeft, bool moveRight)
-{
-  speed = abs(speed); // Ensure positive value
-  speed = constrain(speed, 0, MAX_SPEED);
-
-  // Calculate individual motor speeds for turning
-  int leftSpeed = speed;
-  int rightSpeed = speed;
-
-  // Adjust speeds for turning - differential drive
-  // Note: When going backward, reducing right motor makes it turn left and vice versa
-  if (moveLeft)
-  {
-    rightSpeed = speed / 2; // Reduce right motor speed to turn left while going backward
-  }
-  else if (moveRight)
-  {
-    leftSpeed = speed / 2; // Reduce left motor speed to turn right while going backward
-  }
-
-  // Set directions for backward movement
-  digitalWrite(MOTOR1_IN1, LOW);
-  digitalWrite(MOTOR1_IN2, HIGH);
-  digitalWrite(MOTOR2_IN1, LOW);
-  digitalWrite(MOTOR2_IN2, HIGH);
-
-  // Apply speeds to each motor independently
-  ledcWrite(MOTOR1_CHANNEL, leftSpeed);
-  ledcWrite(MOTOR2_CHANNEL, rightSpeed);
-}
-
-void StopWheels()
-{
-  // Set all direction pins LOW for brake mode
-  digitalWrite(MOTOR1_IN1, LOW);
-  digitalWrite(MOTOR1_IN2, LOW);
-  digitalWrite(MOTOR2_IN1, LOW);
-  digitalWrite(MOTOR2_IN2, LOW);
-
-  // Set PWM to 0 to ensure motors get no power
-  ledcWrite(MOTOR1_CHANNEL, 0);
-  ledcWrite(MOTOR2_CHANNEL, 0);
 }
